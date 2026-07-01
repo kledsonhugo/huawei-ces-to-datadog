@@ -1,9 +1,47 @@
 import os
 import json
+import sys
+import logging
+import traceback
 from obs import ObsClient
 from kafka import KafkaConsumer, TopicPartition
 import requests
 import urllib3
+
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# LOG: Filtro de correlation ID
+# =========================
+class _ExecutionFilter(logging.Filter):
+    """
+    Filter que injeta execution_id em cada LogRecord.
+
+    Objetivo:
+    - Garantir que todos os logs de uma mesma execução compartilhem o mesmo ID
+    - Facilitar busca e correlação de logs no FunctionGraph
+    """
+    execution_id = "N/A"
+
+    def filter(self, record):
+        record.exec_id = _ExecutionFilter.execution_id
+        return True
+
+
+logger.addFilter(_ExecutionFilter())
+
+# No FunctionGraph, stdout costuma ser o stream mais visível no painel de logs.
+# Por isso, o handler é configurado explicitamente para sys.stdout.
+if not logger.handlers:
+    _handler = logging.StreamHandler(stream=sys.stdout)
+    _handler.setFormatter(logging.Formatter(
+        '[%(exec_id)s] %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(_handler)
+
+logger.propagate = False
+logger.setLevel(logging.INFO)
 
 
 # =========================
@@ -75,7 +113,7 @@ def get_previous_last_processed_offset(
     )
 
     if resp.status == 404:
-        print("offset object não existe. Criando ...")
+        logger.info("offset object não existe. Criando ...")
 
         initial_value = 0
         payload = json.dumps({"previous_last_processed_offset": initial_value})
@@ -290,8 +328,8 @@ def convert_to_datadog_format(messages):
             payload = json.loads(msg["value"])
             metrics = payload.get("metrics", [])
         except Exception as e:
-            print("Erro ao fazer parse do payload Kafka")
-            print(str(e))
+            logger.error("Erro ao fazer parse do payload Kafka")
+            logger.error(str(e))
             continue
 
         for metric in metrics:
@@ -304,8 +342,8 @@ def convert_to_datadog_format(messages):
                 collect_time = metric.get("collect_time", msg["timestamp"])
                 dimensions = metric_info.get("dimensions", [])
             except Exception as e:
-                print("Erro processando métrica")
-                print(str(e))
+                logger.error("Erro processando métrica")
+                logger.error(str(e))
                 continue
 
             timestamp_seconds = int(collect_time / 1000)
@@ -378,11 +416,11 @@ def send_to_datadog(datadog_payload):
             timeout=10,
             verify=False
         )
-        print(f"[DataDog] Status: {response.status_code}")
-        print(f"[DataDog] Response: {response.text}")
+        logger.info(f"[DataDog] Status: {response.status_code}")
+        logger.info(f"[DataDog] Response: {response.text}")
     except Exception as e:
-        print("Falha na chamada da API do DataDog")
-        print(str(e))
+        logger.error("Falha na chamada da API do DataDog")
+        logger.error(str(e))
 
 
 # =========================
@@ -465,11 +503,11 @@ def consume_messages(
         current_last_processed_offset = message.offset
 
         if len(messages) >= max_messages:
-            print(f"Consumo atingiu limite MAX_MESSAGES de {max_messages} mensagens")
+            logger.info(f"Consumo atingiu limite MAX_MESSAGES de {max_messages} mensagens")
             break
 
         if message.offset >= current_last_available_offset - 1:
-            print("Última mensagem disponível no tópico atingida")
+            logger.info("Última mensagem disponível no tópico atingida")
             break
 
     return messages, current_last_processed_offset
@@ -496,6 +534,8 @@ def handler(event, context):
 
     obs_client = None
     kafka_consumer = None
+    id = get_id()
+    _ExecutionFilter.execution_id = str(id)
 
     try:
 
@@ -508,29 +548,35 @@ def handler(event, context):
         kafka_partition_id = 0
         max_messages = int(os.getenv('MAX_MESSAGES'))
 
-        # Gerar identificador único
-        id = get_id()
+        logger.info("Início da execução")
 
         # Criar clientes OBS e Kafka
+        logger.info("Criando clientes OBS e Kafka")
         obs_client = create_obs_client(context, obs_endpoint)
         kafka_consumer = create_kafka_consumer(kafka_bootstrap)
+        logger.info("Clientes OBS e Kafka criados com sucesso")
 
         # Recuperar offset da última execução
+        logger.info("Recuperando offset da última execução")
         previous_last_processed_offset = get_previous_last_processed_offset(
             obs_client, 
             obs_bucket, 
             obs_object_last_processed_offset
         )
+        logger.info(f"Offset anterior: {previous_last_processed_offset}")
 
         # Recuperar último offset disponível no Kafka
+        logger.info("Recuperando último offset disponível no Kafka")
         current_last_available_offset = get_current_last_available_offset(
             kafka_consumer, 
             kafka_topic, 
             kafka_partition_id
         )
+        logger.info(f"Último offset disponível no Kafka: {current_last_available_offset}")
 
         # Consumir mensagens Kafka e persistir dados originais
         current_start_offset = previous_last_processed_offset + 1
+        logger.info(f"Consumindo mensagens - start_offset={current_start_offset}, max={max_messages}")
         messages, current_last_processed_offset = consume_messages(
             kafka_consumer,
             kafka_topic,
@@ -539,22 +585,28 @@ def handler(event, context):
             current_start_offset,
             current_last_available_offset
         )
+        logger.info(f"Mensagens consumidas: {len(messages)}, último offset processado: {current_last_processed_offset}")
 
         # Salvar mensagens originais para debug/troubleshooting
         if messages:
+            logger.info("Salvando mensagens originais no OBS")
             save_original_messages(obs_client, obs_bucket, messages, id)
 
         # Converter para formato DataDog e persistir dados transformados
         if messages:
+            logger.info("Convertendo mensagens para formato DataDog")
             datadog_payload = convert_to_datadog_format(messages)
+            logger.info(f"Payload DataDog gerado com {len(datadog_payload.get('series', []))} métricas")
             save_datadog_payload(obs_client, obs_bucket, datadog_payload, id)
 
         # Enviar para DataDog
         if messages:
+            logger.info("Enviando métricas para DataDog")
             send_to_datadog(datadog_payload)
 
         # Atualizar offset
         if messages:
+            logger.info(f"Atualizando offset para {current_last_processed_offset}")
             update_last_processed_offset(
                 obs_client,
                 obs_bucket,
@@ -563,7 +615,7 @@ def handler(event, context):
             )
 
         # Saída do contrato da function
-        return {
+        result = {
             "id": id,
             "statusCode": 200,
             "previousLastProcessedOffset": previous_last_processed_offset,
@@ -572,9 +624,13 @@ def handler(event, context):
             "currentLastProcessedOffset": current_last_processed_offset,
             "consumedMessages": len(messages)
         }
+        logger.info(f"Execução concluída com sucesso - {result}")
+        return result
 
     except Exception as e:
-        print("Erro:", str(e))
+        tb = traceback.format_exc()
+        logger.error(f"Erro: {str(e)}")
+        logger.error(f"Traceback: {tb}")
 
         return {
             "id": id,
