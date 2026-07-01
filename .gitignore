@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Dist-info (packaging metadata - should not be committed)
+*.dist-info/
+
 # Spyder project settings
 .spyderproject
 .spyproject
